@@ -1,0 +1,7 @@
+[package]
+name = "warp-ternary-vote"
+version = "0.1.0"
+edition = "2021"
+description = "Experiment: GPU warp-level ternary voting simulation. 32 threads with {-1,0,+1} values, warp reduce, warp ballot, majority voting."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/warp-ternary-vote"
