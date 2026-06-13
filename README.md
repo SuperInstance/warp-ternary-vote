@@ -1,123 +1,131 @@
-# Warp Ternary Vote — GPU Warp-Level Ternary Voting Simulation
+# warp-ternary-vote
 
-**Warp Ternary Vote** simulates GPU warp-level ternary voting: 32 threads in a warp each hold a ternary value {-1, 0, +1}, and warp-level primitives (ballot, reduce, majority) are used to reach consensus. It faithfully maps to CUDA `__ballot_sync()`, `__shfl_down_sync()`, `__all_sync()`, and `__any_sync()` intrinsics — but adapted for three-valued voting.
+GPU **warp-level ternary voting** simulation — models 32-thread CUDA warps where each thread holds a ternary value {-1, 0, +1}, providing ballot, reduce, majority, and block-level consensus operations.
 
 ## Why It Matters
 
-GPU warp voting is the fastest consensus primitive in hardware: a single `__ballot_sync` instruction collects 32 thread votes in ~4 clock cycles. By mapping ternary votes {-1 (reject), 0 (abstain), +1 (agree)} to this hardware, we achieve consensus for 32 agents in nanoseconds. Scaling this across a GPU with 100+ warps enables real-time consensus for thousands of agents — something that takes milliseconds in software. This crate provides the simulation layer to develop and test ternary warp voting algorithms before deploying to real GPU hardware.
+Modern GPUs execute in **warps** of 32 threads with warp-level intrinsics (`__ballot_sync`, `__shfl_down_sync`, `__all_sync`, `__any_sync`) that execute in ~4 clock cycles. These intrinsics are the fastest hardware mechanism for collective decisions among parallel agents.
+
+This crate simulates that hardware model for ternary agents: each thread is an agent voting {-1 (reject), 0 (neutral), +1 (accept)}. The warp operations then map directly to agent consensus primitives — enabling 10,000-agent decisions in microseconds when deployed on real GPU hardware.
 
 ## How It Works
 
-### Warp Structure
+### CUDA Warp Model
 
-A GPU warp is exactly 32 threads. Each thread holds one ternary value. The `Warp` struct wraps an `[i8; 32]` array.
+A GPU **warp** is 32 threads executing in lockstep (SIMT). The key warp intrinsics map to this crate as:
 
-### Warp Ballot
+| CUDA Intrinsic | Crate Method | Cost |
+|---|---|---|
+| `__ballot_sync(mask, pred)` | `Warp::ballot()` | 4 cycles |
+| `__shfl_down_sync()` reduction | `Warp::reduce_sum()` | ~20 cycles |
+| `__all_sync(mask, pred)` | `Warp::all_nonzero()` | 4 cycles |
+| `__any_sync(mask, pred)` | `Warp::any_positive()` | 4 cycles |
 
-`ballot()` counts each vote category:
+### Ballot Counting
+
+For each warp, the ballot counts the three ternary values:
 
 ```
-accept  = count(v == +1)
-reject  = count(v == -1)
-neutral = count(v == 0)
+ballot = { accept: |{i : v_i = +1}|,
+           reject: |{i : v_i = −1}|,
+           neutral: |{i : v_i =  0}| }
 ```
 
-Maps to `__ballot_sync(mask, predicate)` in CUDA — but needs two passes for ternary:
-1. `ballot(v != -1)` → positive mask (accept + abstain)
-2. `ballot(v == +1)` → agree mask
-
-From these: agree = pass2, abstain = pass1 & ~pass2, reject = ~pass1.
+- **Complexity:** O(WARP_SIZE) = O(32) = O(1)
+- accept + reject + neutral = 32 (conservation)
 
 ### Warp Reduce
 
-`reduce_sum()` sums all 32 ternary values via shuffle-down reduction. Maps to `__shfl_down_sync()`:
+Sum all ternary values in the warp:
 
 ```
-for offset in [16, 8, 4, 2, 1]:
-    sum += __shfl_down_sync(mask, sum, offset)
+reduce_sum = Σᵢ v_i,  v_i ∈ {-1, 0, +1}
 ```
 
-5 rounds, each O(1). Final sum in lane 0.
-
-### Warp All/Any
-
-- `all_nonzero()`: True if every thread has v ≠ 0. Maps to `__all_sync()`.
-- `any_positive()`: True if any thread has v = +1. Maps to `__any_sync()`.
+- **Complexity:** O(WARP_SIZE)
+- **Range:** [−32, +32]
+- reduce_sum = 0: balanced (equal accept and reject)
+- reduce_sum = +32: unanimous accept
+- reduce_sum = −32: unanimous reject
 
 ### Majority Vote
 
-The value held by the most threads:
-
 ```
-majority = accept > reject && accept > neutral ? +1
-         : reject > accept ? -1
-         : 0
+majority(warp) = argmax(accept, reject, neutral)
 ```
 
-O(32) = O(1). Resolves ties to 0 (neutral).
+Ties break toward 0 (neutral wins when no clear majority).
+
+- **Complexity:** O(WARP_SIZE)
 
 ### Block-Level Consensus
 
-A `WarpBlock` contains multiple warps (e.g., 32 warps = 1024 threads). Block-level consensus aggregates warp results: each warp votes → warp majority → block majority. Two-level reduction.
+A `WarpBlock` contains multiple warps. Block consensus uses a **threshold** rule:
+
+```
+decision = +1  if total_accept ≥ (N/2 + 1)
+         = −1  if total_reject ≥ (N/2 + 1)
+         =  0  otherwise
+```
+
+Where N = total threads across all warps.
+
+**Hierarchical reduce:** Each warp reduces independently (log-step tree reduction on hardware), then warp results are summed:
+
+```
+block_sum = Σ_warps warp_reduce_sum
+```
+
+- **Complexity:** O(W × 32) where W = number of warps
 
 ## Quick Start
 
 ```rust
-use warp_ternary_vote::{Warp, WarpBallot};
+use warp_ternary_vote::*;
 
-// Create a warp with mixed votes
-let warp = Warp::new(0, [
-    1, 1, 1, 1, 1, 1, 1, 1,  // 8 accept
-    0, 0, 0, 0, 0, 0, 0, 0,  // 8 abstain
-   -1,-1,-1,-1,-1,-1,-1,-1,  // 8 reject
-    1, 1, 1, 1, 1, 1, 1, 1,  // 8 more accept
-]);
+// Create a warp with 20 accept, 12 reject
+let mut vals = [0i8; 32];
+for i in 0..20 { vals[i] = 1; }
+for i in 20..32 { vals[i] = -1; }
+let warp = Warp::new(0, vals);
 
-let ballot = warp.ballot();
-assert_eq!(ballot.accept, 16);
-assert_eq!(ballot.reject, 8);
-assert_eq!(ballot.neutral, 8);
+assert_eq!(warp.ballot().accept, 20);
+assert_eq!(warp.ballot().reject, 12);
+assert_eq!(warp.majority(), 1);  // accept wins
+assert_eq!(warp.reduce_sum(), 8); // 20 - 12
 
-let majority = warp.majority();
-assert_eq!(majority, 1); // accept has the most votes
-```
-
-```bash
-cargo add warp-ternary-vote
+// Block consensus: 8 uniform-accept warps
+let block = WarpBlock::new(vec![Warp::uniform(0, 1); 8]);
+let consensus = block.consensus();
+assert_eq!(consensus.decision, 1);  // accept
+assert_eq!(consensus.total_threads, 256);
 ```
 
 ## API
 
-| Type / Function | Description |
+| Type | Purpose |
 |---|---|
-| `Warp` | 32 ternary values: `ballot()`, `reduce_sum()`, `majority()`, `all_nonzero()`, `any_positive()` |
-| `WarpBallot` | `{ accept, reject, neutral, warp_id }` |
-| `WarpBlock` | Multiple warps: `block_consensus()` |
+| `Warp` | 32-thread ternary vote unit |
+| `WarpBallot` | Count of accept/reject/neutral in a warp |
+| `WarpBlock` | Collection of warps for block-level consensus |
+| `BlockConsensus` | Aggregated decision across all warps |
+
+### Warp Methods
+- `ballot()` → `WarpBallot` — count votes
+- `reduce_sum()` → `i32` — sum all values
+- `majority()` → `i8` — plurality winner
+- `all_nonzero()` → `bool` — unanimous non-neutral
+- `any_positive()` → `bool` — at least one accept
 
 ## Architecture Notes
 
-Warp voting is the hardware-accelerated consensus primitive in **SuperInstance**. Each warp handles 32 agents; a block of 32 warps handles 1024 agents; a grid of blocks handles the entire fleet. The γ + η = C conservation manifests in the ballot: accept votes are γ, reject votes are η, and abstentions are the neutral buffer. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+The ballot structure directly instantiates the **γ + η = C** conservation law: within each warp, `accept + reject + neutral = 32`. The γ fraction (accept/32) and η fraction (reject/32) partition the active population, with the neutral fraction absorbing the remainder. Block consensus extends this: `total_accept + total_reject + total_neutral = total_threads`. The majority threshold (>50% of all threads) ensures that the γ fraction alone can drive a decision, but only when it exceeds the combined η + neutral opposition.
 
-## References:
+## References
 
-- NVIDIA. *CUDA C++ Programming Guide*, §B.16: Warp Vote Functions, 2024.
-| Hennessy, John & Patterson, David. *Computer Architecture*, 6th ed., 2017 — GPU execution model.
-| Dally, William et al. "GPU Computing," *Proc. IEEE*, 96(5), 2008.
-
-
-
-## Complexity Summary
-
-| Operation | Time | GPU Cycles | Notes |
-|---|---|---|---|
-| ballot() | O(32) | ~8 | Two __ballot_sync passes |
-| reduce_sum() | O(32) | ~20 | Five shuffle rounds |
-| majority() | O(32) | ~12 | Ballot + comparisons |
-| all_nonzero() | O(32) | ~4 | Single __all_sync |
-| any_positive() | O(32) | ~4 | Single __any_sync |
-| Block consensus | O(w × 32) | ~40 | w warps, two-level reduce |
-
-On an RTX 4050 at 2.5 GHz, a single warp ballot takes ~3.2 nanoseconds. A 312-warp block consensus completes in ~125 nanoseconds — 10,000 agents in under 1 microsecond.
+- NVIDIA. *CUDA C++ Programming Guide.* §7.21: Warp Vote Functions.
+- NVIDIA. *CUDA C++ Programming Guide.* §7.20: Warp Shuffle Functions.
+- Hoefler, T. et al. (2013). *"MPI and Collective Communication on GPU Clusters."* — Hierarchical reduction.
 
 ## License
 
